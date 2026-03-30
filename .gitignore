@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtual env / conda
+venv/
+.env/
+.conda/
+env/
+*.bat
+
+# Jupyter / logs
+.ipynb_checkpoints/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# datasets
+ps2.0/
+datasets/
+parking_slot_roi_dataset/
+parking_slot_cls_dataset/
+parking_yolov10_data/
+
+# training outputs
+runs/
+parking_yolov10_runs/
+parking_slot_cls_runs/
+parking_end2end_vis/
+parking_slot_eval_vis/
+parking_slot_gt_vis/
+parking_slot_pred_vis/
+parking_slot_pred_vis_v2/
+
+# weights
+*.pt
+*.pth
+*.onnx
+
+# temp / cache
+.cache/
