@@ -1,0 +1,8 @@
+# CNR-EXT 车位框数据（由 scripts/convert_cnr_ext_to_yolo.py 生成，LABEL_MODE=slot_bbox）
+# 若输出目录不同，请只改 path，与脚本里的 OUT_ROOT 保持一致
+path: E:/parking_yolov10_data_cnr
+train: images/train
+val: images/val
+
+nc: 1
+names: ['parking_slot']
