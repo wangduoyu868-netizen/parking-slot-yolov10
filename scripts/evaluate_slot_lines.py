@@ -1,35 +1,18 @@
-import os
+import argparse
 import json
 import math
+import os
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
 import cv2
 import numpy as np
 
-# ===== 路径 =====
-IMG_DIR = r"E:\Programs\download\ps2.0\testing\all"
-JSON_DIR = r"E:\谷歌下载\ps_json_label\ps_json_label\testing\all"
-TXT_DIR = r"E:\parking_yolov10_runs\test_pred_points\labels"
-OUT_VIS_DIR = r"E:\parking_slot_eval_vis"
-
-os.makedirs(OUT_VIS_DIR, exist_ok=True)
-
-# ===== 参数 =====
-LINE_DIST_THRESH = 15
-MIN_CONF = 0.52
-MAX_LINES = 2
-
-SHORT_MIN = 140
-SHORT_MAX = 220
-LONG_MIN = 320
-LONG_MAX = 390
-
-ENDPOINT_THRESH = 20   # 端点匹配阈值（像素）
-
-# 可视化前几张
-VIS_NUM = 20
-
-
-def is_valid_slot_length(dist):
-    return (SHORT_MIN <= dist <= SHORT_MAX) or (LONG_MIN <= dist <= LONG_MAX)
+# ===== 默认路径（与旧版脚本一致，可用命令行覆盖）=====
+_DEFAULT_IMG_DIR = r"E:\Programs\download\ps2.0\testing\all"
+_DEFAULT_JSON_DIR = r"E:\谷歌下载\ps_json_label\ps_json_label\testing\all"
+_DEFAULT_TXT_DIR = r"E:\parking_yolov10_runs\test_pred_points\labels"
+_DEFAULT_OUT_VIS_DIR = r"E:\parking_slot_eval_vis"
 
 
 def point_line_distance(px, py, x1, y1, x2, y2):
@@ -42,7 +25,7 @@ def point_line_distance(px, py, x1, y1, x2, y2):
     return abs(A * px + B * py + C) / denom
 
 
-def load_pred_points(txt_path, img_w, img_h):
+def load_pred_points(txt_path, img_w, img_h, min_conf: float):
     points = []
     if not os.path.exists(txt_path):
         return points
@@ -62,7 +45,7 @@ def load_pred_points(txt_path, img_w, img_h):
         if len(parts) >= 6:
             conf = float(parts[5])
 
-        if conf >= MIN_CONF:
+        if conf >= min_conf:
             points.append((xc, yc, conf))
 
     return points
@@ -114,16 +97,30 @@ def sort_points_along_line(points, group_indices):
     return [idx for idx, _ in sorted_pairs]
 
 
-def build_pred_slot_lines(img_path, txt_path):
+def build_pred_slot_lines(
+    img_path,
+    txt_path,
+    *,
+    line_dist_thresh: int,
+    min_conf: float,
+    max_lines: int,
+    short_min: int,
+    short_max: int,
+    long_min: int,
+    long_max: int,
+):
+    def is_valid_slot_length(dist):
+        return (short_min <= dist <= short_max) or (long_min <= dist <= long_max)
+
     img = cv2.imread(img_path)
     h, w = img.shape[:2]
 
-    points = load_pred_points(txt_path, w, h)
+    points = load_pred_points(txt_path, w, h, min_conf)
     remaining = list(range(len(points)))
     line_groups = []
 
-    for _ in range(MAX_LINES):
-        group = find_best_line_group(points, remaining, LINE_DIST_THRESH)
+    for _ in range(max_lines):
+        group = find_best_line_group(points, remaining, line_dist_thresh)
         if len(group) < 2:
             break
         line_groups.append(group)
@@ -231,12 +228,10 @@ def greedy_match(pred_lines, gt_lines, thresh):
 def draw_vis(img_path, save_path, gt_lines, pred_lines, matches):
     img = cv2.imread(img_path)
 
-    # 先画GT：绿色
     for line in gt_lines:
         (x1, y1), (x2, y2) = line
         cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
-    # 再画Pred：红色
     for line in pred_lines:
         (x1, y1), (x2, y2) = line
         cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 1)
@@ -244,47 +239,130 @@ def draw_vis(img_path, save_path, gt_lines, pred_lines, matches):
     cv2.imwrite(save_path, img)
 
 
-all_tp = 0
-all_fp = 0
-all_fn = 0
+def run_slot_line_eval(
+    img_dir: str,
+    json_dir: str,
+    txt_dir: str,
+    *,
+    out_vis_dir: Optional[str] = None,
+    vis_num: int = 20,
+    line_dist_thresh: int = 15,
+    min_conf: float = 0.52,
+    max_lines: int = 2,
+    short_min: int = 140,
+    short_max: int = 220,
+    long_min: int = 320,
+    long_max: int = 390,
+    endpoint_thresh: int = 20,
+) -> Dict[str, Any]:
+    """
+    在测试集上统计车位线 TP/FP/FN 及 P/R/F1。
+    txt_dir 下为与 json 同名的 YOLO 预测 txt（含置信度列时优于 min_conf 的点会参与）。
+    """
+    if out_vis_dir:
+        os.makedirs(out_vis_dir, exist_ok=True)
 
-names = []
-for file in os.listdir(JSON_DIR):
-    if file.lower().endswith(".json"):
-        names.append(os.path.splitext(file)[0])
+    names = []
+    for file in os.listdir(json_dir):
+        if file.lower().endswith(".json"):
+            names.append(os.path.splitext(file)[0])
+    names = sorted(names)
 
-names = sorted(names)
+    all_tp = all_fp = all_fn = 0
 
-for idx, name in enumerate(names):
-    img_path = os.path.join(IMG_DIR, name + ".jpg")
-    json_path = os.path.join(JSON_DIR, name + ".json")
-    txt_path = os.path.join(TXT_DIR, name + ".txt")
+    for idx, name in enumerate(names):
+        img_path = os.path.join(img_dir, name + ".jpg")
+        json_path = os.path.join(json_dir, name + ".json")
+        txt_path = os.path.join(txt_dir, name + ".txt")
 
-    if not os.path.exists(img_path):
-        continue
+        if not os.path.exists(img_path):
+            continue
 
-    pred_lines, pred_points = build_pred_slot_lines(img_path, txt_path)
-    gt_lines, marks = build_gt_slot_lines(json_path)
+        pred_lines, _ = build_pred_slot_lines(
+            img_path,
+            txt_path,
+            line_dist_thresh=line_dist_thresh,
+            min_conf=min_conf,
+            max_lines=max_lines,
+            short_min=short_min,
+            short_max=short_max,
+            long_min=long_min,
+            long_max=long_max,
+        )
+        gt_lines, _ = build_gt_slot_lines(json_path)
 
-    tp, fp, fn, matches = greedy_match(pred_lines, gt_lines, ENDPOINT_THRESH)
+        tp, fp, fn, matches = greedy_match(pred_lines, gt_lines, endpoint_thresh)
 
-    all_tp += tp
-    all_fp += fp
-    all_fn += fn
+        all_tp += tp
+        all_fp += fp
+        all_fn += fn
 
-    if idx < VIS_NUM:
-        save_path = os.path.join(OUT_VIS_DIR, name + "_eval.jpg")
-        draw_vis(img_path, save_path, gt_lines, pred_lines, matches)
+        if out_vis_dir and idx < vis_num:
+            save_path = os.path.join(out_vis_dir, name + "_eval.jpg")
+            draw_vis(img_path, save_path, gt_lines, pred_lines, matches)
 
-precision = all_tp / (all_tp + all_fp + 1e-9)
-recall = all_tp / (all_tp + all_fn + 1e-9)
-f1 = 2 * precision * recall / (precision + recall + 1e-9)
+    precision = all_tp / (all_tp + all_fp + 1e-9)
+    recall = all_tp / (all_tp + all_fn + 1e-9)
+    f1 = 2 * precision * recall / (precision + recall + 1e-9)
 
-print("===== Slot Line Evaluation =====")
-print("TP =", all_tp)
-print("FP =", all_fp)
-print("FN =", all_fn)
-print("Precision =", precision)
-print("Recall =", recall)
-print("F1 =", f1)
-print(f"可视化结果已保存到: {OUT_VIS_DIR}")
+    return {
+        "tp": all_tp,
+        "fp": all_fp,
+        "fn": all_fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "num_images": len(names),
+    }
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="车位线几何恢复 + 与 GT 线段匹配评估")
+    p.add_argument("--img_dir", type=str, default=_DEFAULT_IMG_DIR)
+    p.add_argument("--json_dir", type=str, default=_DEFAULT_JSON_DIR)
+    p.add_argument("--txt_dir", type=str, default=_DEFAULT_TXT_DIR)
+    p.add_argument("--out_vis_dir", type=str, default=_DEFAULT_OUT_VIS_DIR)
+    p.add_argument("--vis_num", type=int, default=20)
+    p.add_argument("--line_dist_thresh", type=int, default=15)
+    p.add_argument("--min_conf", type=float, default=0.52)
+    p.add_argument("--max_lines", type=int, default=2)
+    p.add_argument("--short_min", type=int, default=140)
+    p.add_argument("--short_max", type=int, default=220)
+    p.add_argument("--long_min", type=int, default=320)
+    p.add_argument("--long_max", type=int, default=390)
+    p.add_argument("--endpoint_thresh", type=int, default=20)
+    p.add_argument("--no_vis", action="store_true", help="不写可视化图")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = _parse_args(argv)
+    out_vis = None if args.no_vis else args.out_vis_dir
+    r = run_slot_line_eval(
+        args.img_dir,
+        args.json_dir,
+        args.txt_dir,
+        out_vis_dir=out_vis,
+        vis_num=args.vis_num,
+        line_dist_thresh=args.line_dist_thresh,
+        min_conf=args.min_conf,
+        max_lines=args.max_lines,
+        short_min=args.short_min,
+        short_max=args.short_max,
+        long_min=args.long_min,
+        long_max=args.long_max,
+        endpoint_thresh=args.endpoint_thresh,
+    )
+    print("===== Slot Line Evaluation =====")
+    print("TP =", r["tp"])
+    print("FP =", r["fp"])
+    print("FN =", r["fn"])
+    print("Precision =", r["precision"])
+    print("Recall =", r["recall"])
+    print("F1 =", r["f1"])
+    if out_vis:
+        print(f"可视化结果已保存到: {out_vis}")
+
+
+if __name__ == "__main__":
+    main()
