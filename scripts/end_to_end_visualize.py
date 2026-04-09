@@ -37,7 +37,6 @@ LONG_MAX = 390
 # =========================
 PATCH_W = 256
 PATCH_H = 256
-MARGIN_RATIO = 0.18
 DEPTH_RATIO = 1.35
 DEPTH_MIN = 120
 DEPTH_MAX = 280
@@ -157,12 +156,10 @@ def build_slot_quad(p1, p2, img_w, img_h):
 
     n = n1 if d1 > d2 else n2
 
-    margin = line_len * MARGIN_RATIO
-
-    a = p1 - t * margin
-    b = p2 + t * margin
+    a = p1.copy()
+    b = p2.copy()
     c = b + n * depth
-    d = a + n * depth
+    d_pt = a + n * depth
 
     def clip_point(pt):
         x, y = pt
@@ -173,9 +170,9 @@ def build_slot_quad(p1, p2, img_w, img_h):
     a = clip_point(a)
     b = clip_point(b)
     c = clip_point(c)
-    d = clip_point(d)
+    d_pt = clip_point(d_pt)
 
-    quad = np.array([a, b, c, d], dtype=np.float32)
+    quad = np.array([a, b, c, d_pt], dtype=np.float32)
     return quad
 
 def warp_patch(img, quad):

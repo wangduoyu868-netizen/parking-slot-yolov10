@@ -25,7 +25,6 @@ class PipelineParams:
     long_max: int = 390
     patch_w: int = 256
     patch_h: int = 256
-    margin_ratio: float = 0.18
     depth_ratio: float = 1.35
     depth_min: int = 120
     depth_max: int = 280
@@ -172,11 +171,10 @@ class ParkingSlotPipeline:
         d2 = np.linalg.norm(cand2 - center)
         n = n1 if d1 > d2 else n2
 
-        margin = line_len * p.margin_ratio
-        a = p1 - t * margin
-        b = p2 + t * margin
+        a = p1.copy()
+        b = p2.copy()
         c = b + n * depth
-        d = a + n * depth
+        d_pt = a + n * depth
 
         def clip_point(pt):
             x, y = pt
@@ -184,7 +182,7 @@ class ParkingSlotPipeline:
             y = max(0, min(img_h - 1, y))
             return np.array([x, y], dtype=np.float32)
 
-        quad = np.array([clip_point(a), clip_point(b), clip_point(c), clip_point(d)], dtype=np.float32)
+        quad = np.array([clip_point(a), clip_point(b), clip_point(c), clip_point(d_pt)], dtype=np.float32)
         return quad
 
     def warp_patch(self, img, quad, p: PipelineParams):
