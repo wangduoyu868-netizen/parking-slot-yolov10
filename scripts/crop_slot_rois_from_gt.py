@@ -24,7 +24,6 @@ os.makedirs(VIS_DIR, exist_ok=True)
 PATCH_W = 256
 PATCH_H = 256
 
-MARGIN_RATIO = 0.18
 DEPTH_RATIO = 1.35
 DEPTH_MIN = 120
 DEPTH_MAX = 280
@@ -58,8 +57,8 @@ def clip_point(pt, w, h):
 
 def build_slot_quad(p1, p2, img_w, img_h):
     """
-    根据slot line两个端点，生成车位ROI四边形
-    方向：远离图像中心的一侧
+    根据 slot line 两个端点生成车位 ROI 四边形；入口边即为两端点连线，
+    深度沿远离图像中心的法向延伸。
     """
     p1 = np.array(p1, dtype=np.float32)
     p2 = np.array(p2, dtype=np.float32)
@@ -90,20 +89,17 @@ def build_slot_quad(p1, p2, img_w, img_h):
 
     n = n1 if d1 > d2 else n2
 
-    margin = line_len * MARGIN_RATIO
-
-    # 四边形四点：slot line为内边，外扩形成ROI
-    a = p1 - t * margin
-    b = p2 + t * margin
+    a = p1.copy()
+    b = p2.copy()
     c = b + n * depth
-    d = a + n * depth
+    d_pt = a + n * depth
 
     a = clip_point(a, img_w, img_h)
     b = clip_point(b, img_w, img_h)
     c = clip_point(c, img_w, img_h)
-    d = clip_point(d, img_w, img_h)
+    d_pt = clip_point(d_pt, img_w, img_h)
 
-    quad = np.array([a, b, c, d], dtype=np.float32)
+    quad = np.array([a, b, c, d_pt], dtype=np.float32)
     return quad
 
 def warp_patch(img, quad):

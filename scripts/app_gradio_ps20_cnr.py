@@ -35,7 +35,6 @@ class PipelineParams:
     long_max: int = 390
     patch_w: int = 256
     patch_h: int = 256
-    margin_ratio: float = 0.18
     depth_ratio: float = 1.35
     depth_min: int = 120
     depth_max: int = 280
@@ -59,10 +58,20 @@ def _ps20_line_size_en(dist: float, p: PipelineParams) -> str:
     return "other"
 
 
+def _build_cls_mobilenet(device: torch.device, state_path: str) -> nn.Module:
+    weights = models.MobileNet_V3_Small_Weights.DEFAULT
+    m = models.mobilenet_v3_small(weights=weights)
+    inf = m.classifier[3].in_features
+    m.classifier[3] = nn.Linear(inf, 2)
+    m.load_state_dict(torch.load(state_path, map_location=device))
+    return m.to(device).eval()
+
+
 class ParkingSlotPipeline:
     def __init__(
         self,
-        cls_model_path: str,
+        cls_model_path_ps20: str,
+        cls_model_path_cnr: str,
         det_ps20_path: Optional[str] = None,
         det_cnr_path: Optional[str] = None,
     ):
@@ -70,13 +79,8 @@ class ParkingSlotPipeline:
         self.det_ps20: Optional[YOLO] = YOLO(det_ps20_path) if det_ps20_path else None
         self.det_cnr: Optional[YOLO] = YOLO(det_cnr_path) if det_cnr_path else None
 
-        weights = models.MobileNet_V3_Small_Weights.DEFAULT
-        self.cls_model = models.mobilenet_v3_small(weights=weights)
-        in_features = self.cls_model.classifier[3].in_features
-        self.cls_model.classifier[3] = nn.Linear(in_features, 2)
-        self.cls_model.load_state_dict(torch.load(cls_model_path, map_location=self.device))
-        self.cls_model = self.cls_model.to(self.device)
-        self.cls_model.eval()
+        self.cls_ps20 = _build_cls_mobilenet(self.device, cls_model_path_ps20)
+        self.cls_cnr = _build_cls_mobilenet(self.device, cls_model_path_cnr)
 
         self.cls_transform = transforms.Compose(
             [
@@ -208,11 +212,11 @@ class ParkingSlotPipeline:
         d2 = np.linalg.norm(cand2 - center)
         n = n1 if d1 > d2 else n2
 
-        margin = line_len * p.margin_ratio
-        a = p1 - t * margin
-        b = p2 + t * margin
+        # 入口边严格为 slot line 两端点，不再沿切向外扩
+        a = p1.copy()
+        b = p2.copy()
         c = b + n * depth
-        d = a + n * depth
+        d_pt = a + n * depth
 
         def clip_point(pt):
             x, y = pt
@@ -220,7 +224,7 @@ class ParkingSlotPipeline:
             y = max(0, min(img_h - 1, y))
             return np.array([x, y], dtype=np.float32)
 
-        quad = np.array([clip_point(a), clip_point(b), clip_point(c), clip_point(d)], dtype=np.float32)
+        quad = np.array([clip_point(a), clip_point(b), clip_point(c), clip_point(d_pt)], dtype=np.float32)
         return quad
 
     def warp_patch(self, img, quad, p: PipelineParams):
@@ -236,16 +240,16 @@ class ParkingSlotPipeline:
         patch_bgr: np.ndarray,
         cls_layout: tuple,
         legacy_bgr_as_rgb: bool,
+        cls_net: nn.Module,
     ):
         """
-        legacy_bgr_as_rgb=True：不把 BGR 转成 RGB，直接交给 ToPILImage（与旧版 app_gradio/end2end 一致，通道被当成 RGB 用）。
-        legacy_bgr_as_rgb=False：BGR→RGB，与 ImageFolder 读图训练一致。
-        cls_layout：长度为 2，cls_layout[i] 为 logits 第 i 类名称（默认 occupied, vacant）。
+        legacy_bgr_as_rgb=True：不把 BGR 转成 RGB，直接交给 ToPILImage（与旧版 app_gradio 一致）。
+        legacy_bgr_as_rgb=False：BGR→RGB，与 ImageFolder / CNR patch 训练一致。
         """
         arr = patch_bgr if legacy_bgr_as_rgb else cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
         x = self.cls_transform(arr).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            logits = self.cls_model(x)
+            logits = cls_net(x)
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
             pred_idx = int(np.argmax(probs))
             state = cls_layout[pred_idx]
@@ -256,7 +260,7 @@ class ParkingSlotPipeline:
         image_rgb: np.ndarray,
         p: PipelineParams,
         cls_layout: tuple,
-        legacy_bgr_as_rgb: bool,
+        legacy_bgr_ps20: bool,
     ):
         img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         vis = img.copy()
@@ -274,7 +278,7 @@ class ParkingSlotPipeline:
                 continue
 
             patch = self.warp_patch(img, quad, p)
-            state, conf = self.classify_patch(patch, cls_layout, legacy_bgr_as_rgb)
+            state, conf = self.classify_patch(patch, cls_layout, legacy_bgr_ps20, self.cls_ps20)
             dist = math.hypot(x2 - x1, y2 - y1)
             size_en = _ps20_line_size_en(dist, p)
 
@@ -284,8 +288,10 @@ class ParkingSlotPipeline:
                 vacant += 1
 
             color = (0, 0, 255) if state == "occupied" else (0, 255, 0)
-            cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
+            # 车位区域：由 slot line 两端点 (x1,y1)-(x2,y2) 经 build_slot_quad 推出的四边形（与分类 warp 一致）
             self.draw_quad(vis, quad, color, 2)
+            # 恢复出的车位线（检测点连线），叠画在入口一侧便于对照
+            cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
 
             mx = int((x1 + x2) / 2)
             my = int((y1 + y2) / 2)
@@ -340,7 +346,7 @@ class ParkingSlotPipeline:
         image_rgb: np.ndarray,
         cp: CnRParams,
         cls_layout: tuple,
-        legacy_bgr_as_rgb: bool,
+        legacy_bgr_cnr: bool,
     ):
         if self.det_cnr is None:
             raise RuntimeError("未加载 CNR 检测模型。")
@@ -386,7 +392,7 @@ class ParkingSlotPipeline:
             if crop.size == 0:
                 continue
 
-            state, pconf = self.classify_patch(crop, cls_layout, legacy_bgr_as_rgb)
+            state, pconf = self.classify_patch(crop, cls_layout, legacy_bgr_cnr, self.cls_cnr)
             if state == "occupied":
                 occupied += 1
                 occ_idx = 1
@@ -398,6 +404,7 @@ class ParkingSlotPipeline:
             size_counts[cat][occ_idx] += 1
 
             color = (0, 0, 255) if state == "occupied" else (0, 255, 0)
+            # 可视化用检测器原始框（原图尺度）；分类用的 pad 裁剪不单独画框，避免误以为是「缩小车位」
             cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             tx = int(max(0, min(w - 1, x1)))
             ty = int(max(0, min(h - 1, y1 - 8)))
@@ -440,7 +447,8 @@ def run_inference(
     mode,
     det_model_ps20,
     det_model_cnr,
-    cls_model_path,
+    cls_model_path_ps20,
+    cls_model_path_cnr,
     det_conf_ps20,
     line_dist_thresh,
     max_lines,
@@ -455,16 +463,20 @@ def run_inference(
     cnr_fb_small,
     cnr_fb_large,
     swap_cls_indices,
-    legacy_bgr_as_rgb,
+    legacy_bgr_ps20,
+    legacy_bgr_cnr,
 ):
     global pipeline, pipeline_paths
     if image is None:
         raise gr.Error("请先上传图片。")
-    if not cls_model_path:
-        raise gr.Error("请填写分类模型路径。")
+    p20 = (cls_model_path_ps20 or "").strip()
+    cnrp = (cls_model_path_cnr or "").strip()
+    if not p20 or not os.path.isfile(p20):
+        raise gr.Error("请填写有效的 PS2.0 分类模型路径 (.pth)。")
+    if not cnrp or not os.path.isfile(cnrp):
+        raise gr.Error("请填写有效的 CNR 分类模型路径 (.pth)。")
 
     cls_layout = CLS_LAYOUT_SWAPPED if swap_cls_indices else CLS_LAYOUT_IMAGEFOLDER
-    legacy_bgr = bool(legacy_bgr_as_rgb)
 
     mode = (mode or "").strip()
     if mode.startswith("PS2.0"):
@@ -478,10 +490,11 @@ def run_inference(
         det_cnr = det_model_cnr.strip()
         det_ps20 = det_model_ps20.strip() if det_model_ps20 else ""
 
-    key = ("both" if (det_ps20 and det_cnr) else mode, cls_model_path, det_ps20, det_cnr)
+    key = (mode, p20, cnrp, det_ps20, det_cnr)
     if pipeline is None or pipeline_paths.get("key") != key:
         pipeline = ParkingSlotPipeline(
-            cls_model_path,
+            cls_model_path_ps20=p20,
+            cls_model_path_cnr=cnrp,
             det_ps20_path=det_ps20 if det_ps20 else None,
             det_cnr_path=det_cnr if det_cnr else None,
         )
@@ -499,7 +512,7 @@ def run_inference(
             long_min=int(long_min),
             long_max=int(long_max),
         )
-        return pipeline.infer_image_ps20(image, params, cls_layout, legacy_bgr)
+        return pipeline.infer_image_ps20(image, params, cls_layout, bool(legacy_bgr_ps20))
 
     if pipeline.det_cnr is None:
         raise gr.Error("CNR 检测模型加载失败。")
@@ -511,16 +524,17 @@ def run_inference(
         fallback_small_ratio_of_min_side=float(cnr_fb_small),
         fallback_large_ratio_of_min_side=float(cnr_fb_large),
     )
-    return pipeline.infer_image_cnr(image, cp, cls_layout, legacy_bgr)
+    return pipeline.infer_image_cnr(image, cp, cls_layout, bool(legacy_bgr_cnr))
 
 
 with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
     gr.Markdown(
         "## 停车位检测与占用（PS2.0 / CNR）\n"
         "- **输出图像上的文字**为英文：`vacant` / `occupied`，尺寸 `small|medium|large`（CNR）或 `short|long|other`（PS2.0）。\n"
-        "- 分类器与训练脚本一致：**类别 0 = occupied，1 = vacant**（ImageFolder 子目录名）。若整体反了请勾选「交换类别」。\n"
-        "- **Legacy BGR**：与 `app_gradio.py` 相同（不转 RGB）。若要对齐 **ImageFolder 读图训练**，请取消勾选。\n"
-        "- CNR 裁剪与 PS2.0 透视 ROI 分布不同，占用易错；请用 `scripts/crop_cnr_patches_for_occ_dataset.py` 裁块标注后运行 `finetune_occ_classifier_cnr.py` 做域微调。"
+        "- **PS2.0 绘图**：由恢复的 **slot line 两端点** 经 `build_slot_quad` 推出车位四边形并描边，再叠画粗线标出该车位线。\n"
+        "- 分类器：**类别 0 = occupied，1 = vacant**。若整体反了请勾选「交换类别」。\n"
+        "- **两套权重**：PS2.0 默认 `best_mobilenetv3_small.pth`（与 `app_gradio.py` 一致）；CNR 默认 CNR-EXT 150 patch 训练权重。**Legacy BGR** 分两档：PS2.0 默认勾选（旧训练）；CNR 默认不勾选（RGB 训练）。\n"
+        "- 自裁 CNR 小图微调仍可用 `crop_cnr_patches_for_occ_dataset.py` + `finetune_occ_classifier_cnr.py`。"
     )
 
     mode = gr.Radio(
@@ -542,19 +556,28 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
             label="CNR 车位检测模型 (.pt)",
             value=r"E:\Programs\download\ps2.0\parking-slot-yolov10\runs\detect\train\weights\best.pt",
         )
-        cls_model_path = gr.Textbox(
-            label="占用分类模型 (.pth，两种模式共用)",
-            value=r"E:\parking_slot_cls_runs_cnr\best_mobilenetv3_small_cnr_ft.pth",
-        )
+
+    cls_model_path_ps20 = gr.Textbox(
+        label="PS2.0 占用分类 (.pth，透视 ROI)",
+        value=r"E:\parking_slot_cls_runs\best_mobilenetv3_small.pth",
+    )
+    cls_model_path_cnr = gr.Textbox(
+        label="CNR 占用分类 (.pth，检测框裁剪)",
+        value=r"E:\parking_slot_cls_runs_cnr_ext_p150\best_mobilenetv3_cnr_ext_p150.pth",
+    )
 
     with gr.Row():
         swap_cls_indices = gr.Checkbox(
             label="交换类别索引（空/占整体反了时勾选）",
             value=False,
         )
-        legacy_bgr_as_rgb = gr.Checkbox(
-            label="Legacy：BGR 直接进分类器（与 app_gradio.py 一致）",
+        legacy_bgr_ps20 = gr.Checkbox(
+            label="PS2.0：Legacy BGR（与 app_gradio.py 一致，默认开）",
             value=True,
+        )
+        legacy_bgr_cnr = gr.Checkbox(
+            label="CNR：Legacy BGR（EXT patch 训练请关，默认关）",
+            value=False,
         )
 
     gr.Markdown("### PS2.0 参数（仅标记点模式）")
@@ -590,7 +613,8 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
             mode,
             det_model_ps20,
             det_model_cnr,
-            cls_model_path,
+            cls_model_path_ps20,
+            cls_model_path_cnr,
             det_conf_ps20,
             line_dist_thresh,
             max_lines,
@@ -605,7 +629,8 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
             cnr_fb_small,
             cnr_fb_large,
             swap_cls_indices,
-            legacy_bgr_as_rgb,
+            legacy_bgr_ps20,
+            legacy_bgr_cnr,
         ],
         outputs=[image_output, text_output],
     )
