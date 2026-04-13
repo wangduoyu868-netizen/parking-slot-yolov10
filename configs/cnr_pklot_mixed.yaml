@@ -1,0 +1,13 @@
+# Mixed Dataset Configuration
+# Merges CNR (class 0: parking_slot) and PKLot (classes harmonized to 0)
+
+path: E:/Programs/download/ps2.0/parking-slot-yolov10
+train:
+  - E:/parking_yolov10_data_cnr/images/train
+  - E:/谷歌下载/PKLot.v2-640.yolov8/train/images
+val:
+  - E:/parking_yolov10_data_cnr/images/val
+  - E:/谷歌下载/PKLot.v2-640.yolov8/valid/images
+
+nc: 1
+names: ['parking_slot']
