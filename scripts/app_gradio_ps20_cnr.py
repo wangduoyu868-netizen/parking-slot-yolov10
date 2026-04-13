@@ -7,8 +7,9 @@ Classifier: ImageFolder order class 0 = occupied, 1 = vacant (folder names occup
 
 import math
 import os
+import hashlib
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import gradio as gr
@@ -27,6 +28,7 @@ CLS_LAYOUT_SWAPPED = ("vacant", "occupied")
 @dataclass
 class PipelineParams:
     det_conf: float = 0.52
+    iou: float = 0.45
     line_dist_thresh: int = 15
     max_lines: int = 2
     short_min: int = 140
@@ -43,6 +45,7 @@ class PipelineParams:
 @dataclass
 class CnRParams:
     det_conf: float = 0.25
+    iou: float = 0.45
     box_pad_ratio: float = 0.08
     small_mult: float = 0.90
     large_mult: float = 1.12
@@ -68,19 +71,31 @@ def _build_cls_mobilenet(device: torch.device, state_path: str) -> nn.Module:
 
 
 class ParkingSlotPipeline:
-    def __init__(
-        self,
-        cls_model_path_ps20: str,
-        cls_model_path_cnr: str,
-        det_ps20_path: Optional[str] = None,
-        det_cnr_path: Optional[str] = None,
-    ):
+    def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.det_ps20: Optional[YOLO] = YOLO(det_ps20_path) if det_ps20_path else None
-        self.det_cnr: Optional[YOLO] = YOLO(det_cnr_path) if det_cnr_path else None
+        
+        # Models
+        self.det_ps20: Optional[YOLO] = None
+        self.det_cnr: Optional[YOLO] = None
+        self.cls_ps20: Optional[nn.Module] = None
+        self.cls_cnr: Optional[nn.Module] = None
+        
+        # Model paths
+        self.path_det_ps20 = ""
+        self.path_det_cnr = ""
+        self.path_cls_ps20 = ""
+        self.path_cls_cnr = ""
 
-        self.cls_ps20 = _build_cls_mobilenet(self.device, cls_model_path_ps20)
-        self.cls_cnr = _build_cls_mobilenet(self.device, cls_model_path_cnr)
+        # Caching for detection to decouple from post-processing
+        self._last_img_hash_ps20 = ""
+        self._last_conf_ps20 = -1
+        self._last_iou_ps20 = -1
+        self._cached_points_ps20 = []
+        
+        self._last_img_hash_cnr = ""
+        self._last_conf_cnr = -1
+        self._last_iou_cnr = -1
+        self._cached_xyxy_cnr = None
 
         self.cls_transform = transforms.Compose(
             [
@@ -90,44 +105,68 @@ class ParkingSlotPipeline:
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
+        
+    def _get_image_hash(self, img: np.ndarray) -> str:
+        return hashlib.md5(img.data.tobytes()).hexdigest()
 
-    @staticmethod
-    def point_line_distance(px, py, x1, y1, x2, y2):
-        a = y2 - y1
-        b = x1 - x2
-        c = x2 * y1 - x1 * y2
-        denom = math.sqrt(a * a + b * b)
-        if denom < 1e-6:
-            return 1e9
-        return abs(a * px + b * py + c) / denom
+    def update_models(self, p20: str, cnrp: str, det_ps20: str, det_cnr: str, mode: str):
+        if mode.startswith("PS2.0") and det_ps20 and det_ps20 != self.path_det_ps20:
+            print(f"Loading PS2.0 Detector: {det_ps20}")
+            self.det_ps20 = YOLO(det_ps20)
+            self.path_det_ps20 = det_ps20
+            self._last_img_hash_ps20 = "" 
+            
+        if mode.startswith("CNR") and det_cnr and det_cnr != self.path_det_cnr:
+            print(f"Loading CNR Detector: {det_cnr}")
+            self.det_cnr = YOLO(det_cnr)
+            self.path_det_cnr = det_cnr
+            self._last_img_hash_cnr = ""
+
+        if p20 and p20 != self.path_cls_ps20:
+            print(f"Loading PS2.0 Classifier: {p20}")
+            self.cls_ps20 = _build_cls_mobilenet(self.device, p20)
+            self.path_cls_ps20 = p20
+            
+        if cnrp and cnrp != self.path_cls_cnr:
+            print(f"Loading CNR Classifier: {cnrp}")
+            self.cls_cnr = _build_cls_mobilenet(self.device, cnrp)
+            self.path_cls_cnr = cnrp
 
     def is_valid_slot_length(self, dist, p: PipelineParams):
         return (p.short_min <= dist <= p.short_max) or (p.long_min <= dist <= p.long_max)
 
     def find_best_line_group(self, points, remaining_indices, dist_thresh):
-        best_group = []
         if len(remaining_indices) < 2:
-            return best_group
+            return []
 
-        for i in range(len(remaining_indices)):
-            for j in range(i + 1, len(remaining_indices)):
+        rem_pts = np.array([[points[idx][0], points[idx][1]] for idx in remaining_indices], dtype=np.float32)
+        best_group = []
+        n_rem = len(remaining_indices)
+
+        for i in range(n_rem):
+            for j in range(i + 1, n_rem):
                 idx1 = remaining_indices[i]
                 idx2 = remaining_indices[j]
-
-                x1, y1, _ = points[idx1]
-                x2, y2, _ = points[idx2]
+                x1, y1 = rem_pts[i]
+                x2, y2 = rem_pts[j]
+                
                 if math.hypot(x2 - x1, y2 - y1) < 5:
                     continue
 
-                group = []
-                for idx in remaining_indices:
-                    px, py, _ = points[idx]
-                    d = self.point_line_distance(px, py, x1, y1, x2, y2)
-                    if d < dist_thresh:
-                        group.append(idx)
+                a = y2 - y1
+                b = x1 - x2
+                c = x2 * y1 - x1 * y2
+                denom = math.sqrt(a * a + b * b)
+                if denom < 1e-6:
+                    continue
+                
+                dists = np.abs(rem_pts[:, 0] * a + rem_pts[:, 1] * b + c) / denom
+                valid_mask = dists < dist_thresh
+                
+                group_len = np.sum(valid_mask)
+                if group_len > len(best_group):
+                    best_group = [remaining_indices[k] for k in range(n_rem) if valid_mask[k]]
 
-                if len(group) > len(best_group):
-                    best_group = group
         return best_group
 
     @staticmethod
@@ -151,20 +190,46 @@ class ParkingSlotPipeline:
             p2 = tuple(quad_int[(i + 1) % 4])
             cv2.line(img, p1, p2, color, thickness)
 
-    def detect_marking_points(self, img, det_conf):
+    def detect_marking_points(self, img, det_conf, iou):
+        img_hash = self._get_image_hash(img)
+        if img_hash == self._last_img_hash_ps20 and det_conf == self._last_conf_ps20 and iou == self._last_iou_ps20:
+            return self._cached_points_ps20
+            
         if self.det_ps20 is None:
             raise RuntimeError("未加载 PS2.0 检测模型。")
-        results = self.det_ps20(img, conf=det_conf, verbose=False)[0]
+        results = self.det_ps20(img, conf=det_conf, iou=iou, verbose=False)[0]
         points = []
-        if results.boxes is None or len(results.boxes) == 0:
-            return points
-
-        xywh = results.boxes.xywh.cpu().numpy()
-        confs = results.boxes.conf.cpu().numpy()
-        for box, conf in zip(xywh, confs):
-            xc, yc, _, _ = box
-            points.append((float(xc), float(yc), float(conf)))
+        if results.boxes is not None and len(results.boxes) > 0:
+            xywh = results.boxes.xywh.cpu().numpy()
+            confs = results.boxes.conf.cpu().numpy()
+            for box, conf in zip(xywh, confs):
+                xc, yc, _, _ = box
+                points.append((float(xc), float(yc), float(conf)))
+                
+        self._last_img_hash_ps20 = img_hash
+        self._last_conf_ps20 = det_conf
+        self._last_iou_ps20 = iou
+        self._cached_points_ps20 = points
         return points
+
+    def detect_cnr_boxes(self, img, det_conf, iou):
+        img_hash = self._get_image_hash(img)
+        if img_hash == self._last_img_hash_cnr and det_conf == self._last_conf_cnr and iou == self._last_iou_cnr:
+            return self._cached_xyxy_cnr
+            
+        if self.det_cnr is None:
+            raise RuntimeError("未加载 CNR 检测模型。")
+        results = self.det_cnr(img, conf=det_conf, iou=iou, verbose=False)[0]
+        
+        xyxy = None
+        if results.boxes is not None and len(results.boxes) > 0:
+            xyxy = results.boxes.xyxy.cpu().numpy()
+            
+        self._last_img_hash_cnr = img_hash
+        self._last_conf_cnr = det_conf
+        self._last_iou_cnr = iou
+        self._cached_xyxy_cnr = xyxy
+        return xyxy
 
     def build_pred_slot_lines(self, points, p: PipelineParams):
         remaining = list(range(len(points)))
@@ -212,7 +277,6 @@ class ParkingSlotPipeline:
         d2 = np.linalg.norm(cand2 - center)
         n = n1 if d1 > d2 else n2
 
-        # 入口边严格为 slot line 两端点，不再沿切向外扩
         a = p1.copy()
         b = p2.copy()
         c = b + n * depth
@@ -235,25 +299,32 @@ class ParkingSlotPipeline:
         mat = cv2.getPerspectiveTransform(quad, dst)
         return cv2.warpPerspective(img, mat, (p.patch_w, p.patch_h))
 
-    def classify_patch(
+    def classify_patches_batch(
         self,
-        patch_bgr: np.ndarray,
+        patches_bgr: List[np.ndarray],
         cls_layout: tuple,
         legacy_bgr_as_rgb: bool,
         cls_net: nn.Module,
-    ):
-        """
-        legacy_bgr_as_rgb=True：不把 BGR 转成 RGB，直接交给 ToPILImage（与旧版 app_gradio 一致）。
-        legacy_bgr_as_rgb=False：BGR→RGB，与 ImageFolder / CNR patch 训练一致。
-        """
-        arr = patch_bgr if legacy_bgr_as_rgb else cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2RGB)
-        x = self.cls_transform(arr).unsqueeze(0).to(self.device)
+    ) -> List[Tuple[str, float]]:
+        if not patches_bgr:
+            return []
+            
+        tensors = []
+        for patch in patches_bgr:
+            arr = patch if legacy_bgr_as_rgb else cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+            tensors.append(self.cls_transform(arr))
+            
+        batch_x = torch.stack(tensors).to(self.device)
         with torch.no_grad():
-            logits = cls_net(x)
-            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-            pred_idx = int(np.argmax(probs))
+            logits = cls_net(batch_x)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            
+        results = []
+        for prob in probs:
+            pred_idx = int(np.argmax(prob))
             state = cls_layout[pred_idx]
-            return state, float(probs[pred_idx])
+            results.append((state, float(prob[pred_idx])))
+        return results
 
     def infer_image_ps20(
         self,
@@ -266,19 +337,32 @@ class ParkingSlotPipeline:
         vis = img.copy()
         h, w = img.shape[:2]
 
-        points = self.detect_marking_points(img, p.det_conf)
+        points = self.detect_marking_points(img, p.det_conf, p.iou)
         pred_lines = self.build_pred_slot_lines(points, p)
 
-        occupied = 0
-        vacant = 0
+        patches = []
+        valid_lines = []
+        line_quads = []
+
         for line in pred_lines:
             (x1, y1), (x2, y2) = line
             quad = self.build_slot_quad((x1, y1), (x2, y2), w, h, p)
             if quad is None:
                 continue
-
             patch = self.warp_patch(img, quad, p)
-            state, conf = self.classify_patch(patch, cls_layout, legacy_bgr_ps20, self.cls_ps20)
+            patches.append(patch)
+            valid_lines.append(line)
+            line_quads.append(quad)
+            
+        cls_results = []
+        if patches:
+            cls_results = self.classify_patches_batch(patches, cls_layout, legacy_bgr_ps20, self.cls_ps20)
+
+        occupied = 0
+        vacant = 0
+        
+        for idx, (line, quad, (state, conf)) in enumerate(zip(valid_lines, line_quads, cls_results)):
+            (x1, y1), (x2, y2) = line
             dist = math.hypot(x2 - x1, y2 - y1)
             size_en = _ps20_line_size_en(dist, p)
 
@@ -288,9 +372,7 @@ class ParkingSlotPipeline:
                 vacant += 1
 
             color = (0, 0, 255) if state == "occupied" else (0, 255, 0)
-            # 车位区域：由 slot line 两端点 (x1,y1)-(x2,y2) 经 build_slot_quad 推出的四边形（与分类 warp 一致）
             self.draw_quad(vis, quad, color, 2)
-            # 恢复出的车位线（检测点连线），叠画在入口一侧便于对照
             cv2.line(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
 
             mx = int((x1 + x2) / 2)
@@ -348,15 +430,14 @@ class ParkingSlotPipeline:
         cls_layout: tuple,
         legacy_bgr_cnr: bool,
     ):
-        if self.det_cnr is None:
-            raise RuntimeError("未加载 CNR 检测模型。")
         img = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         vis = img.copy()
         h, w = img.shape[:2]
         img_min_side = min(h, w)
 
-        results = self.det_cnr(img, conf=cp.det_conf, verbose=False)[0]
-        if results.boxes is None or len(results.boxes) == 0:
+        xyxy = self.detect_cnr_boxes(img, cp.det_conf, cp.iou)
+        
+        if xyxy is None or len(xyxy) == 0:
             vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
             info = (
                 "模式: CNR（检测框）\n"
@@ -366,8 +447,6 @@ class ParkingSlotPipeline:
             )
             return vis_rgb, info
 
-        xyxy = results.boxes.xyxy.cpu().numpy()
-
         sides: List[float] = []
         for i in range(len(xyxy)):
             x1, y1, x2, y2 = xyxy[i]
@@ -376,6 +455,10 @@ class ParkingSlotPipeline:
         occupied = vacant = 0
         size_counts = {"small": [0, 0], "medium": [0, 0], "large": [0, 0]}
 
+        patches = []
+        valid_indices = []
+        valid_xyxy = []
+        
         for i in range(len(xyxy)):
             x1, y1, x2, y2 = [float(v) for v in xyxy[i]]
             bw = x2 - x1
@@ -391,8 +474,19 @@ class ParkingSlotPipeline:
             crop = img[yi1:yi2, xi1:xi2]
             if crop.size == 0:
                 continue
+                
+            patches.append(crop)
+            valid_indices.append(i)
+            valid_xyxy.append((x1, y1, x2, y2))
 
-            state, pconf = self.classify_patch(crop, cls_layout, legacy_bgr_cnr, self.cls_cnr)
+        cls_results = []
+        if patches:
+            cls_results = self.classify_patches_batch(patches, cls_layout, legacy_bgr_cnr, self.cls_cnr)
+
+        for patch_idx, (state, pconf) in enumerate(cls_results):
+            i = valid_indices[patch_idx]
+            x1, y1, x2, y2 = valid_xyxy[patch_idx]
+            
             if state == "occupied":
                 occupied += 1
                 occ_idx = 1
@@ -404,7 +498,6 @@ class ParkingSlotPipeline:
             size_counts[cat][occ_idx] += 1
 
             color = (0, 0, 255) if state == "occupied" else (0, 255, 0)
-            # 可视化用检测器原始框（原图尺度）；分类用的 pad 裁剪不单独画框，避免误以为是「缩小车位」
             cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             tx = int(max(0, min(w - 1, x1)))
             ty = int(max(0, min(h - 1, y1 - 8)))
@@ -438,9 +531,7 @@ class ParkingSlotPipeline:
         return vis_rgb, info
 
 
-pipeline = None
-pipeline_paths: dict = {}
-
+global_pipeline = ParkingSlotPipeline()
 
 def run_inference(
     image,
@@ -450,6 +541,7 @@ def run_inference(
     cls_model_path_ps20,
     cls_model_path_cnr,
     det_conf_ps20,
+    det_iou_ps20,
     line_dist_thresh,
     max_lines,
     short_min,
@@ -457,6 +549,7 @@ def run_inference(
     long_min,
     long_max,
     det_conf_cnr,
+    det_iou_cnr,
     box_pad_ratio,
     cnr_small_mult,
     cnr_large_mult,
@@ -466,9 +559,9 @@ def run_inference(
     legacy_bgr_ps20,
     legacy_bgr_cnr,
 ):
-    global pipeline, pipeline_paths
     if image is None:
         raise gr.Error("请先上传图片。")
+        
     p20 = (cls_model_path_ps20 or "").strip()
     cnrp = (cls_model_path_cnr or "").strip()
     if not p20 or not os.path.isfile(p20):
@@ -477,34 +570,25 @@ def run_inference(
         raise gr.Error("请填写有效的 CNR 分类模型路径 (.pth)。")
 
     cls_layout = CLS_LAYOUT_SWAPPED if swap_cls_indices else CLS_LAYOUT_IMAGEFOLDER
-
     mode = (mode or "").strip()
+    
     if mode.startswith("PS2.0"):
         if not det_model_ps20:
             raise gr.Error("PS2.0 模式需要填写 PS2.0 检测模型路径。")
         det_ps20 = det_model_ps20.strip()
-        det_cnr = det_model_cnr.strip() if det_model_cnr else ""
+        det_cnr = ""
     else:
         if not det_model_cnr:
             raise gr.Error("CNR 模式需要填写 CNR 检测模型路径。")
         det_cnr = det_model_cnr.strip()
-        det_ps20 = det_model_ps20.strip() if det_model_ps20 else ""
+        det_ps20 = ""
 
-    key = (mode, p20, cnrp, det_ps20, det_cnr)
-    if pipeline is None or pipeline_paths.get("key") != key:
-        pipeline = ParkingSlotPipeline(
-            cls_model_path_ps20=p20,
-            cls_model_path_cnr=cnrp,
-            det_ps20_path=det_ps20 if det_ps20 else None,
-            det_cnr_path=det_cnr if det_cnr else None,
-        )
-        pipeline_paths = {"key": key}
+    global_pipeline.update_models(p20, cnrp, det_ps20, det_cnr, mode)
 
     if mode.startswith("PS2.0"):
-        if pipeline.det_ps20 is None:
-            raise gr.Error("PS2.0 检测模型加载失败。")
         params = PipelineParams(
             det_conf=det_conf_ps20,
+            iou=det_iou_ps20,
             line_dist_thresh=int(line_dist_thresh),
             max_lines=int(max_lines),
             short_min=int(short_min),
@@ -512,29 +596,26 @@ def run_inference(
             long_min=int(long_min),
             long_max=int(long_max),
         )
-        return pipeline.infer_image_ps20(image, params, cls_layout, bool(legacy_bgr_ps20))
+        return global_pipeline.infer_image_ps20(image, params, cls_layout, bool(legacy_bgr_ps20))
 
-    if pipeline.det_cnr is None:
-        raise gr.Error("CNR 检测模型加载失败。")
     cp = CnRParams(
         det_conf=float(det_conf_cnr),
+        iou=float(det_iou_cnr),
         box_pad_ratio=float(box_pad_ratio),
         small_mult=float(cnr_small_mult),
         large_mult=float(cnr_large_mult),
         fallback_small_ratio_of_min_side=float(cnr_fb_small),
         fallback_large_ratio_of_min_side=float(cnr_fb_large),
     )
-    return pipeline.infer_image_cnr(image, cp, cls_layout, bool(legacy_bgr_cnr))
+    return global_pipeline.infer_image_cnr(image, cp, cls_layout, bool(legacy_bgr_cnr))
 
 
 with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
     gr.Markdown(
-        "## 停车位检测与占用（PS2.0 / CNR）\n"
-        "- **输出图像上的文字**为英文：`vacant` / `occupied`，尺寸 `small|medium|large`（CNR）或 `short|long|other`（PS2.0）。\n"
-        "- **PS2.0 绘图**：由恢复的 **slot line 两端点** 经 `build_slot_quad` 推出车位四边形并描边，再叠画粗线标出该车位线。\n"
-        "- 分类器：**类别 0 = occupied，1 = vacant**。若整体反了请勾选「交换类别」。\n"
-        "- **两套权重**：PS2.0 默认 `best_mobilenetv3_small.pth`（与 `app_gradio.py` 一致）；CNR 默认 CNR-EXT 150 patch 训练权重。**Legacy BGR** 分两档：PS2.0 默认勾选（旧训练）；CNR 默认不勾选（RGB 训练）。\n"
-        "- 自裁 CNR 小图微调仍可用 `crop_cnr_patches_for_occ_dataset.py` + `finetune_occ_classifier_cnr.py`。"
+        "## 停车位检测与占用（PS2.0 / CNR）[已开启性能优化版]\n"
+        "- **GPU批推断**：切图分类过程耗时缩减数倍。\n"
+        "- **指纹级缓存**：任意调节滑块（非置信度滑块）实现毫秒级“重画框”，YOLO 模型不再二次运算。\n"
+        "- **NMS 重叠滤除**：新增了 IoU NMS 滑块，强力清除远景处因框挨得太近导致的一个车位多个检测框堆叠故障。"
     )
 
     mode = gr.Radio(
@@ -572,17 +653,18 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
             value=False,
         )
         legacy_bgr_ps20 = gr.Checkbox(
-            label="PS2.0：Legacy BGR（与 app_gradio.py 一致，默认开）",
+            label="PS2.0：Legacy BGR（默认开）",
             value=True,
         )
         legacy_bgr_cnr = gr.Checkbox(
-            label="CNR：Legacy BGR（EXT patch 训练请关，默认关）",
+            label="CNR：Legacy BGR（默认关）",
             value=False,
         )
 
-    gr.Markdown("### PS2.0 参数（仅标记点模式）")
+    gr.Markdown("### PS2.0 参数（非检测模块重划线瞬间完成）")
     with gr.Row():
-        det_conf_ps20 = gr.Slider(0.1, 0.95, value=0.52, step=0.01, label="PS2.0 DET_CONF")
+        det_conf_ps20 = gr.Slider(0.1, 0.95, value=0.52, step=0.01, label="PS2.0 检测置信度 (会重跑检测)")
+        det_iou_ps20 = gr.Slider(0.1, 0.95, value=0.45, step=0.01, label="PS2.0 NMS IoU (会重跑检测)")
         line_dist_thresh = gr.Slider(5, 40, value=15, step=1, label="LINE_DIST_THRESH")
         max_lines = gr.Slider(1, 4, value=2, step=1, label="MAX_LINES")
 
@@ -592,16 +674,17 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
         long_min = gr.Slider(200, 500, value=320, step=1, label="LONG_MIN")
         long_max = gr.Slider(200, 500, value=390, step=1, label="LONG_MAX")
 
-    gr.Markdown("### CNR 参数（仅检测框模式）")
+    gr.Markdown("### CNR 参数（强力抑制密集车位重叠幻影）")
     with gr.Row():
-        det_conf_cnr = gr.Slider(0.05, 0.95, value=0.25, step=0.01, label="CNR 检测置信度")
-        box_pad_ratio = gr.Slider(0.0, 0.3, value=0.08, step=0.01, label="分类 ROI 外扩（×框最大边）")
+        det_conf_cnr = gr.Slider(0.05, 0.95, value=0.25, step=0.01, label="CNR 检测置信度 (会重跑检测)")
+        det_iou_cnr = gr.Slider(0.05, 0.95, value=0.45, step=0.01, label="CNR NMS IoU (越低杀生越狠，抑制重叠极有效)")
+        box_pad_ratio = gr.Slider(0.0, 0.3, value=0.08, step=0.01, label="分类 ROI 外扩")
 
     with gr.Row():
         cnr_small_mult = gr.Slider(0.5, 0.99, value=0.90, step=0.01, label="尺寸「小」: 长边 < 中位数×")
         cnr_large_mult = gr.Slider(1.01, 1.5, value=1.12, step=0.01, label="尺寸「大」: 长边 > 中位数×")
-        cnr_fb_small = gr.Slider(0.04, 0.2, value=0.10, step=0.01, label="框少时「小」: < 短边×")
-        cnr_fb_large = gr.Slider(0.1, 0.35, value=0.18, step=0.01, label="框少时「大」: > 短边×")
+        cnr_fb_small = gr.Slider(0.04, 0.2, value=0.10, step=0.01, label="框少时「小」")
+        cnr_fb_large = gr.Slider(0.1, 0.35, value=0.18, step=0.01, label="框少时「大」")
 
     run_btn = gr.Button("开始推理", variant="primary")
     text_output = gr.Textbox(label="统计信息（中文）", lines=6)
@@ -616,6 +699,7 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
             cls_model_path_ps20,
             cls_model_path_cnr,
             det_conf_ps20,
+            det_iou_ps20,
             line_dist_thresh,
             max_lines,
             short_min,
@@ -623,6 +707,7 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
             long_min,
             long_max,
             det_conf_cnr,
+            det_iou_cnr,
             box_pad_ratio,
             cnr_small_mult,
             cnr_large_mult,
