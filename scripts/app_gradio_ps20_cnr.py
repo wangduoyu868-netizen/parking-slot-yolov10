@@ -1,8 +1,16 @@
 """
-PS2.0 marking points + CNR bounding boxes in one Gradio app (port 7861).
+PS2.0 marking points + CNR bounding boxes in one Gradio app (default port 7861, override with --port).
 Classifier: ImageFolder order class 0 = occupied, 1 = vacant (folder names occupied/, vacant/).
 
-运行: python scripts/app_gradio_ps20_cnr.py
+运行:
+  python scripts/app_gradio_ps20_cnr.py
+  同一局域网其它设备访问（本机防火墙需放行对应 TCP 端口，默认 7861）:
+  python scripts/app_gradio_ps20_cnr.py --listen
+  端口被占用时换端口:
+  python scripts/app_gradio_ps20_cnr.py --listen --port 7862
+  临时公网链接（经 Gradio 隧道，适合外网演示）:
+  python scripts/app_gradio_ps20_cnr.py --share
+  可同时: --listen --share
 """
 
 import math
@@ -612,10 +620,10 @@ def run_inference(
 
 with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
     gr.Markdown(
-        "## 停车位检测与占用（PS2.0 / CNR）[已开启性能优化版]\n"
+        "## 停车位检测与占用（PS2.0 / CNR）\n"
         "- **GPU批推断**：切图分类过程耗时缩减数倍。\n"
         "- **指纹级缓存**：任意调节滑块（非置信度滑块）实现毫秒级“重画框”，YOLO 模型不再二次运算。\n"
-        "- **NMS 重叠滤除**：新增了 IoU NMS 滑块，强力清除远景处因框挨得太近导致的一个车位多个检测框堆叠故障。"
+        "- **NMS 重叠滤除**：使用IoU NMS 滑块，强力清除远景处因框挨得太近导致的一个车位多个检测框堆叠故障。"
     )
 
     mode = gr.Radio(
@@ -635,7 +643,7 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
         )
         det_model_cnr = gr.Textbox(
             label="CNR 车位检测模型 (.pt)",
-            value=r"E:\Programs\download\ps2.0\parking-slot-yolov10\runs\detect\train\weights\best.pt",
+            value=r"E:\Programs\download\ps2.0\parking-slot-yolov10\runs\detect\train_mixed_final\weights\best.pt",
         )
 
     cls_model_path_ps20 = gr.Textbox(
@@ -722,6 +730,42 @@ with gr.Blocks(title="停车位可视化 PS2.0 + CNR") as demo:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="PS2.0 + CNR Gradio（默认仅本机）")
+    ap.add_argument(
+        "--listen",
+        action="store_true",
+        help="绑定 0.0.0.0，局域网内可用 http://<本机IPv4>:<port> 访问（防火墙需放行该端口）",
+    )
+    ap.add_argument(
+        "--share",
+        action="store_true",
+        help="开启 Gradio share，生成临时公网 URL（适合手机/外网，链接有时效）",
+    )
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("GRADIO_SERVER_PORT", "7861")),
+        metavar="N",
+        help="服务端口（默认 7861；若提示端口被占用可改为 7862 等，或结束占用 7861 的旧进程）",
+    )
+    ns = ap.parse_args()
+
     os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
     os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
-    demo.launch(server_name="127.0.0.1", server_port=7861, show_error=True, inbrowser=True)
+
+    host = "0.0.0.0" if ns.listen else "127.0.0.1"
+    demo.launch(
+        server_name=host,
+        server_port=ns.port,
+        show_error=True,
+        inbrowser=True,
+        share=bool(ns.share),
+    )
+    if ns.listen:
+        print(
+            f"\n[listen] 已在 0.0.0.0:{ns.port} 监听。请在同网段设备浏览器打开: http://<本机局域网IP>:{ns.port}\n"
+            "    查本机 IP（Windows）: ipconfig  → 无线局域网适配器 WLAN 的 IPv4 地址\n"
+            f"    若无法打开，请在防火墙允许 python.exe 入站，或新建入站规则 TCP {ns.port}。\n"
+        )
