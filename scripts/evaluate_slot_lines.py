@@ -3,6 +3,7 @@ import json
 import math
 import os
 import sys
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -13,6 +14,31 @@ _DEFAULT_IMG_DIR = r"E:\Programs\download\ps2.0\testing\all"
 _DEFAULT_JSON_DIR = r"E:\谷歌下载\ps_json_label\ps_json_label\testing\all"
 _DEFAULT_TXT_DIR = r"E:\parking_yolov10_runs\test_pred_points\labels"
 _DEFAULT_OUT_VIS_DIR = r"E:\parking_slot_eval_vis"
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_METRICS_JSON = os.path.join(_REPO_ROOT, "runs", "eval", "slot_line_metrics.json")
+
+
+def save_slot_line_metrics(path: str, r: Dict[str, Any], config: Dict[str, Any]) -> None:
+    """将评测指标与完整参数写入 UTF-8 JSON，便于留档与复现。"""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    payload = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "config": config,
+        "metrics": {
+            "tp": int(r["tp"]),
+            "fp": int(r["fp"]),
+            "fn": int(r["fn"]),
+            "precision": float(r["precision"]),
+            "recall": float(r["recall"]),
+            "f1": float(r["f1"]),
+            "num_images": int(r["num_images"]),
+        },
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 def point_line_distance(px, py, x1, y1, x2, y2):
@@ -332,6 +358,13 @@ def _parse_args(argv=None):
     p.add_argument("--long_max", type=int, default=390)
     p.add_argument("--endpoint_thresh", type=int, default=20)
     p.add_argument("--no_vis", action="store_true", help="不写可视化图")
+    p.add_argument(
+        "--out_metrics",
+        type=str,
+        default=_DEFAULT_METRICS_JSON,
+        help="将 TP/FP/FN/P/R/F1 及参数保存到此 JSON（默认 runs/eval/slot_line_metrics.json）",
+    )
+    p.add_argument("--no_save_metrics", action="store_true", help="不写入指标 JSON")
     return p.parse_args(argv)
 
 
@@ -362,6 +395,26 @@ def main(argv=None) -> None:
     print("F1 =", r["f1"])
     if out_vis:
         print(f"可视化结果已保存到: {out_vis}")
+
+    if not args.no_save_metrics:
+        cfg = {
+            "img_dir": args.img_dir,
+            "json_dir": args.json_dir,
+            "txt_dir": args.txt_dir,
+            "out_vis_dir": args.out_vis_dir,
+            "vis_num": args.vis_num,
+            "no_vis": args.no_vis,
+            "line_dist_thresh": args.line_dist_thresh,
+            "min_conf": args.min_conf,
+            "max_lines": args.max_lines,
+            "short_min": args.short_min,
+            "short_max": args.short_max,
+            "long_min": args.long_min,
+            "long_max": args.long_max,
+            "endpoint_thresh": args.endpoint_thresh,
+        }
+        save_slot_line_metrics(args.out_metrics, r, cfg)
+        print(f"指标已保存到: {args.out_metrics}")
 
 
 if __name__ == "__main__":
