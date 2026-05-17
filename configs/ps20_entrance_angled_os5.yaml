@@ -1,0 +1,10 @@
+path: E:/parking_yolov10_entrance_angled_os5
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names:
+  0: slot_entrance
+
+entrance_extra_dims: 7

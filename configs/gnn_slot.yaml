@@ -1,0 +1,20 @@
+# GNN Slot Detector config
+path: E:/parking_yolov10_data
+train: images/train
+val: images/val
+
+model:
+  desc_dim: 256
+  gnn_layers: 4
+  pretrained: true
+
+train:
+  epochs: 80
+  batch_size: 4
+  lr: 1.0e-4
+  imgsz: 512
+  max_points: 30
+  workers: 0
+  w_point: 1.0
+  w_edge: 2.0
+  w_dir: 2.0

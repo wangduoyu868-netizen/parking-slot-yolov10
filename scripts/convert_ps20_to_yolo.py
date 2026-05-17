@@ -37,8 +37,8 @@ def clamp(v, low, high):
     return max(low, min(v, high))
 
 def mark_to_yolo_line(mark):
-    # mark格式目前按你的数据理解为：
-    # [x, y, dir_x, dir_y, shape]
+    # mark格式：[x, y, dir_x, dir_y, shape]
+    # 输出7值格式：class_id x y w h dx dy
     x = float(mark[0])
     y = float(mark[1])
 
@@ -59,7 +59,22 @@ def mark_to_yolo_line(mark):
     width = w / IMG_W
     height = h / IMG_H
 
-    return f"{cls_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+    # 方向向量：从mark指向dir终点，归一化到单位向量
+    if len(mark) >= 4:
+        dir_x = float(mark[2])
+        dir_y = float(mark[3])
+        dx = dir_x - x
+        dy = dir_y - y
+        norm = (dx * dx + dy * dy) ** 0.5
+        if norm > 1e-6:
+            dx /= norm
+            dy /= norm
+        else:
+            dx, dy = 0.0, 0.0
+    else:
+        dx, dy = 0.0, 0.0
+
+    return f"{cls_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {dx:.6f} {dy:.6f}"
 
 def convert_one_sample(img_src_path, json_src_path, out_img_path, out_txt_path):
     # 复制图片
