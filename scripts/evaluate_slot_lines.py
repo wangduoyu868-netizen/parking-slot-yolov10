@@ -51,6 +51,45 @@ def point_line_distance(px, py, x1, y1, x2, y2):
     return abs(A * px + B * py + C) / denom
 
 
+def auto_compute_length_thresholds(distances, margin=0.15):
+    """智能长短边阈值计算，返回 (short_min, short_max, long_min, long_max)。失败返回 None。"""
+    distances = np.array(distances, dtype=float)
+    if len(distances) < 3:
+        return None
+
+    median_d = np.median(distances)
+    if median_d < 1e-6:
+        return None
+
+    # 过滤过小距离（内侧点间距等噪声），小于中位数 50% 的视为非车位线
+    valid = distances[distances > median_d * 0.55]
+    if len(valid) < 2:
+        valid = distances
+
+    # 判断能否分为有意义的两簇：最大距离 > 中位数 × 1.3 才认为有长短之分
+    can_split = len(valid) >= 4 and (np.max(valid) / median_d) > 1.3
+
+    if can_split:
+        med_v = np.median(valid)
+        short_d = valid[valid <= med_v]
+        long_d = valid[valid > med_v]
+        if len(short_d) >= 2 and len(long_d) >= 2:
+            short_min = int(np.percentile(short_d, 5) * (1 - margin))
+            short_max = int(np.percentile(short_d, 95) * (1 + margin))
+            long_min = int(np.percentile(long_d, 5) * (1 - margin))
+            long_max = int(np.percentile(long_d, 95) * (1 + margin))
+            if short_max >= long_min:
+                mid = (short_max + long_min) // 2
+                short_max = mid
+                long_min = mid + 1
+            return (short_min, short_max, long_min, long_max)
+
+    # 无法分簇：用全部有效距离的范围作为单一区间
+    lo = int(np.percentile(valid, 5) * (1 - margin))
+    hi = int(np.percentile(valid, 95) * (1 + margin))
+    return (lo, hi, hi + 1, hi + 1)
+
+
 def load_pred_points(txt_path, img_w, img_h, min_conf: float):
     points = []
     if not os.path.exists(txt_path):
@@ -134,10 +173,8 @@ def build_pred_slot_lines(
     short_max: int,
     long_min: int,
     long_max: int,
+    auto_length: bool = False,
 ):
-    def is_valid_slot_length(dist):
-        return (short_min <= dist <= short_max) or (long_min <= dist <= long_max)
-
     img = cv2.imread(img_path)
     h, w = img.shape[:2]
 
@@ -152,21 +189,35 @@ def build_pred_slot_lines(
         line_groups.append(group)
         remaining = [idx for idx in remaining if idx not in group]
 
-    pred_lines = []
-
+    # 收集所有候选线段
+    candidates = []
     for group in line_groups:
         sorted_group = sort_points_along_line(points, group)
         for k in range(len(sorted_group) - 1):
             idx1 = sorted_group[k]
             idx2 = sorted_group[k + 1]
-
             x1, y1, _ = points[idx1]
             x2, y2, _ = points[idx2]
-
             dist = math.hypot(x2 - x1, y2 - y1)
-            if not is_valid_slot_length(dist):
-                continue
+            candidates.append(((x1, y1), (x2, y2), dist))
 
+    # 自动计算阈值或使用手动值
+    if auto_length:
+        all_dists = [c[2] for c in candidates]
+        auto_thresh = auto_compute_length_thresholds(all_dists)
+        if auto_thresh:
+            s_min, s_max, l_min, l_max = auto_thresh
+        else:
+            s_min, s_max = short_min, short_max
+            l_min, l_max = long_min, long_max
+    else:
+        s_min, s_max = short_min, short_max
+        l_min, l_max = long_min, long_max
+
+    # 过滤
+    pred_lines = []
+    for (x1, y1), (x2, y2), dist in candidates:
+        if (s_min <= dist <= s_max) or (l_min <= dist <= l_max):
             pred_lines.append(((x1, y1), (x2, y2)))
 
     return pred_lines, points
@@ -280,6 +331,7 @@ def run_slot_line_eval(
     long_min: int = 320,
     long_max: int = 390,
     endpoint_thresh: int = 20,
+    auto_length: bool = False,
 ) -> Dict[str, Any]:
     """
     在测试集上统计车位线 TP/FP/FN 及 P/R/F1。
@@ -314,6 +366,7 @@ def run_slot_line_eval(
             short_max=short_max,
             long_min=long_min,
             long_max=long_max,
+            auto_length=auto_length,
         )
         gt_lines, _ = build_gt_slot_lines(json_path)
 
@@ -357,6 +410,7 @@ def _parse_args(argv=None):
     p.add_argument("--long_min", type=int, default=320)
     p.add_argument("--long_max", type=int, default=390)
     p.add_argument("--endpoint_thresh", type=int, default=20)
+    p.add_argument("--auto_length", action="store_true", help="自动计算长短边阈值")
     p.add_argument("--no_vis", action="store_true", help="不写可视化图")
     p.add_argument(
         "--out_metrics",
@@ -385,6 +439,7 @@ def main(argv=None) -> None:
         long_min=args.long_min,
         long_max=args.long_max,
         endpoint_thresh=args.endpoint_thresh,
+        auto_length=args.auto_length,
     )
     print("===== Slot Line Evaluation =====")
     print("TP =", r["tp"])

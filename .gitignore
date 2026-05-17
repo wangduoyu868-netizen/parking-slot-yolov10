@@ -19,15 +19,24 @@ env/
 .DS_Store
 Thumbs.db
 
+# local IDE / agent workspace
+.claude/
+.vscode/
+tasks/
+hatch_pet_runs/
+
 # datasets
 ps2.0/
 datasets/
 parking_slot_roi_dataset/
 parking_slot_cls_dataset/
 parking_yolov10_data/
+annotation_vps/
+annotation_vps.zip
 
 # training outputs
 runs/
+outputs/
 parking_yolov10_runs/
 parking_slot_cls_runs/
 parking_end2end_vis/
@@ -40,6 +49,22 @@ parking_slot_pred_vis_v2/
 *.pt
 *.pth
 *.onnx
+*.weights
+*.caffemodel
+
+# local binaries / archives / generated decks
+*.dll
+*.zip
+ppt_build/
+
+# thesis / private writing assets
+thesis/
+thesis_local/
+模板/
+
+# downloaded baseline binaries
+baselines/DeepPS/
 
 # temp / cache
 .cache/
+docs/out/

@@ -56,10 +56,7 @@ def clip_point(pt, w, h):
     return np.array([x, y], dtype=np.float32)
 
 def build_slot_quad(p1, p2, img_w, img_h):
-    """
-    根据 slot line 两个端点生成车位 ROI 四边形；入口边即为两端点连线，
-    深度沿远离图像中心的法向延伸。
-    """
+    """根据 slot line 两个端点生成车位 ROI 四边形，用标记点分布确定方向。"""
     p1 = np.array(p1, dtype=np.float32)
     p2 = np.array(p2, dtype=np.float32)
 
@@ -68,39 +65,32 @@ def build_slot_quad(p1, p2, img_w, img_h):
     if line_len < 1e-6:
         return None
 
-    # 切向量
     t = vec / line_len
+    n_perp = np.array([-t[1], t[0]], dtype=np.float32)
 
-    # 法向量（两个方向都可能）
-    n1 = np.array([-t[1], t[0]], dtype=np.float32)
-    n2 = -n1
+    depth = np.clip(line_len * DEPTH_RATIO, DEPTH_MIN, DEPTH_MAX)
 
     mid = (p1 + p2) / 2.0
     center = np.array([img_w / 2.0, img_h / 2.0], dtype=np.float32)
 
-    # 向外方向：选择使点更远离图像中心的法向量
-    depth = np.clip(line_len * DEPTH_RATIO, DEPTH_MIN, DEPTH_MAX)
-
-    cand1 = mid + n1 * depth
-    cand2 = mid + n2 * depth
+    cand1 = mid + n_perp * depth
+    cand2 = mid - n_perp * depth
 
     d1 = np.linalg.norm(cand1 - center)
     d2 = np.linalg.norm(cand2 - center)
 
-    n = n1 if d1 > d2 else n2
+    n = n_perp if d1 < d2 else -n_perp
 
     a = p1.copy()
     b = p2.copy()
     c = b + n * depth
     d_pt = a + n * depth
 
-    a = clip_point(a, img_w, img_h)
-    b = clip_point(b, img_w, img_h)
-    c = clip_point(c, img_w, img_h)
-    d_pt = clip_point(d_pt, img_w, img_h)
+    def clip_point(pt):
+        x, y = pt
+        return np.array([max(0, min(img_w - 1, x)), max(0, min(img_h - 1, y))], dtype=np.float32)
 
-    quad = np.array([a, b, c, d_pt], dtype=np.float32)
-    return quad
+    return np.array([clip_point(a), clip_point(b), clip_point(c), clip_point(d_pt)], dtype=np.float32)
 
 def warp_patch(img, quad):
     dst = np.array([
